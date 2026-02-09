@@ -5,11 +5,12 @@ library(ggplot2)
 # ==============================================================================
 # 1. SCAN: Label Candidates
 # ==============================================================================
-#' Label Treatment and Control Stack Candidates
+#' Label Treatment and Control Stack Candidates (Corrected First-Treatment Logic)
 #'
 #' @description
-#' Identifies valid stack candidates by enforcing strict data continuity and
-#' clean history/future constraints.
+#' Identifies valid stack candidates.
+#' Fix: Strictly enforces that 'first' treated stacks must match the ID's
+#' first-ever event time, discarding subsequent events even if they are valid.
 #'
 #' @export
 label_candidates <- function(dt,
@@ -19,16 +20,31 @@ label_candidates <- function(dt,
                              k_pre,
                              k_post,
                              k_freeze,
-                             match_by = -1) {
+                             match_by = -1,
+                             treated_type = c("first", "all"),
+                             control_type = c("all", "nyt", "nt", "nevert")) {
+
+  treated_type <- match.arg(treated_type)
+  control_type <- match.arg(control_type)
 
   if (!inherits(dt, "data.table")) setDT(dt)
 
-  # Deep copy to avoid side effects
+  # 1. Setup & Sorting
   calc_dt <- dt[, .SD, .SDcols = c(id_col, time_col, event_col)]
   setnames(calc_dt, c("id", "period", "event"))
   setorderv(calc_dt, c("id", "period"))
 
-  # Vectorized Distance Logic
+  # 2. Identify "Ever Treated" & "First Event Time"
+  # ----------------------------------------------------------------
+  global_stats <- calc_dt[, .(
+    is_ever_treated = max(event, na.rm=TRUE) == 1,
+    # Force numeric to match NA_real_ type
+    first_treat_time = if(max(event, na.rm=TRUE)==1) as.numeric(min(period[event==1], na.rm=TRUE)) else NA_real_
+  ), by = id]
+
+  calc_dt <- merge(calc_dt, global_stats, by = "id", all.x = TRUE)
+
+  # 3. Vectorized Distance Logic
   calc_dt[, evt_idx := ifelse(event == 1, period, NA_real_)]
   calc_dt[, last_evt := nafill(evt_idx, type = "locf"), by = id]
   calc_dt[, next_evt := nafill(evt_idx, type = "nocb"), by = id]
@@ -36,11 +52,11 @@ label_candidates <- function(dt,
   calc_dt[, dist_last := period - last_evt]
   calc_dt[, dist_next := next_evt - period]
 
-  # Define "Dirty" Statuses
+  # Dirty Statuses
   calc_dt[, is_dirty_past := !is.na(dist_last) & dist_last >= 0 & dist_last <= (k_post + k_freeze)]
   calc_dt[, is_dirty_future := !is.na(dist_next) & dist_next <= k_post]
 
-  # Continuity Checks
+  # Continuity
   calc_dt[, has_history := (period - shift(period, n = k_pre, type="lag")) == k_pre, by = id]
   calc_dt[, has_future := (shift(period, n = k_post, type="lead") - period) == k_post, by = id]
 
@@ -63,9 +79,38 @@ label_candidates <- function(dt,
             (has_future == TRUE) &
             (sum_dirty_full == 0)]
 
-  # Output
-  treats <- calc_dt[is_valid_treated == TRUE, .(id, cohort_year = period, treat = 1)]
-  ctrls  <- calc_dt[is_valid_control == TRUE, .(id, cohort_year = period, treat = 0)]
+  # 4. Filter Candidates (The Fix)
+  # ----------------------------------------------------------------
+
+  # Include 'first_treat_time' in the extraction
+  treats <- calc_dt[is_valid_treated == TRUE, .(id, cohort_year = period, treat = 1, first_treat_time)]
+
+  if (treated_type == "first") {
+    # STRICT CHECK: The cohort must be the ID's first-ever event.
+    # This ensures we don't accidentally pick up a 2nd event just because the 1st was invalid.
+    treats <- treats[cohort_year == first_treat_time]
+
+    # Deduplicate (safety)
+    treats <- unique(treats, by = "id")
+  }
+
+  # Clean up temp column
+  treats[, first_treat_time := NULL]
+
+  # --- Filter Controls ---
+  ctrls_raw <- calc_dt[is_valid_control == TRUE, .(id, cohort_year = period, treat = 0, is_ever_treated, first_treat_time)]
+
+  if (control_type == "nevert") {
+    ctrls <- ctrls_raw[is_ever_treated == FALSE]
+  } else if (control_type == "nt") {
+    ctrls <- ctrls_raw[is_ever_treated == TRUE]
+  } else if (control_type == "nyt") {
+    ctrls <- ctrls_raw[(is_ever_treated == TRUE) & (cohort_year < first_treat_time)]
+  } else {
+    ctrls <- ctrls_raw
+  }
+
+  ctrls[, c("is_ever_treated", "first_treat_time") := NULL]
 
   candidates <- rbind(treats, ctrls)
   candidates[, match_period := cohort_year + match_by]
@@ -432,6 +477,8 @@ flexmatch <- function(dt,
                       k_freeze,
                       match_vars,
                       match_by = -1,
+                      treated_type = "first",
+                      control_type = "all",
                       assess_quality = TRUE,
                       plot_events = TRUE,
                       verbose = TRUE,
@@ -441,19 +488,24 @@ flexmatch <- function(dt,
   if (!inherits(dt, "data.table")) setDT(dt)
 
   # 1. SCAN
-  if (verbose) message(sprintf("1. Scanning Candidates (Pre: %d, Post: %d)...", k_pre, k_post))
-  cands <- label_candidates(dt, id_col, time_col, event_col, k_pre, k_post, k_freeze, match_by)
+  if (verbose) message(sprintf("1. Scanning Candidates (Type: Treated='%s', Control='%s')...", treated_type, control_type))
 
-  if (nrow(cands[treat == 1]) == 0) stop("No valid treated candidates found.")
-  if (verbose) message(sprintf("   Candidates: %d Treated, %d Control.", nrow(cands[treat == 1]), nrow(cands[treat == 0])))
+  cands <- label_candidates(
+    dt = dt, id_col = id_col, time_col = time_col, event_col = event_col,
+    k_pre = k_pre, k_post = k_post, k_freeze = k_freeze, match_by = match_by,
+    treated_type = treated_type, control_type = control_type
+  )
+
+  n_treat <- nrow(cands[treat == 1])
+  if (n_treat == 0) stop("No valid treated candidates found.")
+  if (verbose) message(sprintf("   Candidates found: %d Treated, %d Control.", n_treat, nrow(cands[treat == 0])))
 
   # 2. MATCH
   if (verbose) message(sprintf("2. Matching on [%s]...", paste(match_vars, collapse = ", ")))
   match_res <- match_candidates(dt, cands, id_col, time_col, match_vars, ...)
 
   n_matched <- uniqueN(match_res$matched_cross_section[treat==1, id])
-  n_total   <- uniqueN(cands[treat==1, id])
-  if (verbose) message(sprintf("   Matched %d / %d Treated units (%.1f%%).", n_matched, n_total, 100 * n_matched / n_total))
+  if (verbose) message(sprintf("   Matched %d / %d Treated units (%.1f%%).", n_matched, n_treat, 100 * n_matched / n_treat))
 
   # 3. BUILD
   if (verbose) message("3. Expanding Stacks...")
@@ -473,7 +525,6 @@ flexmatch <- function(dt,
   if (plot_events) {
     if (verbose) message("5. Generating Event Dynamics Plot...")
     tryCatch({
-      # Pass both original AND matched data for the overlay
       ep <- plot_event_dynamics(
         dt = dt,
         dt_matched = final_data,
