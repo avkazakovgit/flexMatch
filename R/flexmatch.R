@@ -32,33 +32,37 @@ label_candidates <- function(dt,
   # 1. Setup & Sorting
   calc_dt <- dt[, .SD, .SDcols = c(id_col, time_col, event_col)]
   setnames(calc_dt, c("id", "period", "event"))
+
+  # Ensure strict ordering by Time
   setorderv(calc_dt, c("id", "period"))
 
+  # --- CRITICAL: Create Time Index (1..N) ---
+  # This abstracts "Quarters/Days" into simple integers 1, 2, 3...
+  calc_dt[, time_idx := seq_len(.N), by = id]
+
   # 2. Identify "Ever Treated" & "First Event Time"
-  # ----------------------------------------------------------------
   global_stats <- calc_dt[, .(
     is_ever_treated = max(event, na.rm=TRUE) == 1,
-    # Force numeric to match NA_real_ type
-    first_treat_time = if(max(event, na.rm=TRUE)==1) as.numeric(min(period[event==1], na.rm=TRUE)) else NA_real_
+    first_treat_idx = if(max(event, na.rm=TRUE)==1) min(time_idx[event==1], na.rm=TRUE) else NA_integer_
   ), by = id]
 
   calc_dt <- merge(calc_dt, global_stats, by = "id", all.x = TRUE)
 
-  # 3. Vectorized Distance Logic
-  calc_dt[, evt_idx := ifelse(event == 1, period, NA_real_)]
-  calc_dt[, last_evt := nafill(evt_idx, type = "locf"), by = id]
-  calc_dt[, next_evt := nafill(evt_idx, type = "nocb"), by = id]
+  # 3. Vectorized Distance Logic (Using Index)
+  calc_dt[, evt_loc := ifelse(event == 1, time_idx, NA_integer_)]
+  calc_dt[, last_evt := nafill(evt_loc, type = "locf"), by = id]
+  calc_dt[, next_evt := nafill(evt_loc, type = "nocb"), by = id]
 
-  calc_dt[, dist_last := period - last_evt]
-  calc_dt[, dist_next := next_evt - period]
+  calc_dt[, dist_last := time_idx - last_evt]
+  calc_dt[, dist_next := next_evt - time_idx]
 
   # Dirty Statuses
   calc_dt[, is_dirty_past := !is.na(dist_last) & dist_last >= 0 & dist_last <= (k_post + k_freeze)]
   calc_dt[, is_dirty_future := !is.na(dist_next) & dist_next <= k_post]
 
   # Continuity
-  calc_dt[, has_history := (period - shift(period, n = k_pre, type="lag")) == k_pre, by = id]
-  calc_dt[, has_future := (shift(period, n = k_post, type="lead") - period) == k_post, by = id]
+  calc_dt[, has_history := !is.na(shift(time_idx, n = k_pre, type="lag")), by = id]
+  calc_dt[, has_future  := !is.na(shift(time_idx, n = k_post, type="lead")), by = id]
 
   # Valid Treated
   calc_dt[, is_dirty_past_int := as.integer(is_dirty_past)]
@@ -79,41 +83,50 @@ label_candidates <- function(dt,
             (has_future == TRUE) &
             (sum_dirty_full == 0)]
 
-  # 4. Filter Candidates (The Fix)
-  # ----------------------------------------------------------------
-
-  # Include 'first_treat_time' in the extraction
-  treats <- calc_dt[is_valid_treated == TRUE, .(id, cohort_year = period, treat = 1, first_treat_time)]
+  # 4. Filter Candidates
+  treats <- calc_dt[is_valid_treated == TRUE, .(id, cohort_year = period, time_idx, treat = 1, first_treat_idx)]
 
   if (treated_type == "first") {
-    # STRICT CHECK: The cohort must be the ID's first-ever event.
-    # This ensures we don't accidentally pick up a 2nd event just because the 1st was invalid.
-    treats <- treats[cohort_year == first_treat_time]
-
-    # Deduplicate (safety)
+    treats <- treats[time_idx == first_treat_idx]
     treats <- unique(treats, by = "id")
   }
+  treats[, c("first_treat_idx") := NULL]
 
-  # Clean up temp column
-  treats[, first_treat_time := NULL]
-
-  # --- Filter Controls ---
-  ctrls_raw <- calc_dt[is_valid_control == TRUE, .(id, cohort_year = period, treat = 0, is_ever_treated, first_treat_time)]
+  ctrls_raw <- calc_dt[is_valid_control == TRUE, .(id, cohort_year = period, time_idx, treat = 0, is_ever_treated, first_treat_idx)]
 
   if (control_type == "nevert") {
     ctrls <- ctrls_raw[is_ever_treated == FALSE]
   } else if (control_type == "nt") {
     ctrls <- ctrls_raw[is_ever_treated == TRUE]
   } else if (control_type == "nyt") {
-    ctrls <- ctrls_raw[(is_ever_treated == TRUE) & (cohort_year < first_treat_time)]
+    ctrls <- ctrls_raw[(is_ever_treated == TRUE) & (time_idx < first_treat_idx)]
   } else {
     ctrls <- ctrls_raw
   }
-
-  ctrls[, c("is_ever_treated", "first_treat_time") := NULL]
+  ctrls[, c("is_ever_treated", "first_treat_idx") := NULL]
 
   candidates <- rbind(treats, ctrls)
-  candidates[, match_period := cohort_year + match_by]
+
+  # --- FIX: EXACT MATCH PERIOD LOOKUP ---
+  # We calculate the Target Index (e.g. Index 10 + (-1) = Index 9)
+  candidates[, match_time_idx := time_idx + match_by]
+
+  # We map Index 9 back to the REAL Date (e.g., 2015-04-01) using the original data
+  time_map <- calc_dt[, .(id, time_idx, real_match_period = period)]
+
+  # Inner Join serves two purposes:
+  # 1. Retrieves correct Date
+  # 2. Filters out cases where lag is out of bounds
+  candidates <- merge(candidates, time_map,
+                      by.x = c("id", "match_time_idx"),
+                      by.y = c("id", "time_idx"),
+                      all.x = FALSE)
+
+  candidates[, match_period := real_match_period]
+  # Cleanup
+  candidates[, c("match_time_idx", "real_match_period", "time_idx") := NULL]
+
+  # Restore user's ID column name
   setnames(candidates, "id", id_col)
 
   return(candidates)
@@ -128,31 +141,34 @@ label_candidates <- function(dt,
 #' Performs exact cohort matching + 1-to-K matching using MatchIt.
 #'
 #' @export
-match_candidates <- function(dt,
-                             stack_candidates,
-                             id_col,
-                             time_col,
-                             match_vars,
-                             ...) {
+match_candidates <- function(dt, stack_candidates, id_col, time_col, match_vars, ...) {
 
   if (!inherits(dt, "data.table")) setDT(dt)
 
+  # 1. Prepare Covariate Data
   cols_to_fetch <- c(id_col, time_col, match_vars)
   cov_data <- dt[, .SD, .SDcols = cols_to_fetch]
+
+  # Rename for internal safety
   setnames(cov_data, c(id_col, time_col), c("id", "match_period"))
 
-  match_input <- merge(stack_candidates, cov_data,
+  # 2. Prepare Candidate Data
+  match_input_base <- copy(stack_candidates)
+  setnames(match_input_base, id_col, "id")
+
+  # 3. Merge
+  match_input <- merge(match_input_base, cov_data,
                        by = c("id", "match_period"),
                        all.x = FALSE)
+
   match_input <- na.omit(match_input, cols = match_vars)
 
-  # MatchIt Config
+  # 4. MatchIt
   fm <- as.formula(paste("treat ~", paste(match_vars, collapse = " + ")))
   args <- list(...)
   args$formula <- fm
   args$data    <- match_input
 
-  # Inject strict cohort matching
   if ("exact" %in% names(args)) {
     cur <- args$exact
     if (inherits(cur, "formula")) {
@@ -166,15 +182,17 @@ match_candidates <- function(dt,
 
   m_out <- do.call(MatchIt::matchit, args)
 
-  # Robust Get Matches
+  # 5. Output
   matched_data <- as.data.table(MatchIt::get_matches(m_out, id = "matchit_row_id"))
-
-  # Create Identifiers
   matched_data[, stack_id := paste(id, cohort_year, sep = "_")]
+
   treated_map <- matched_data[treat == 1, .(subclass, cohort_id = stack_id)]
   matched_data <- merge(matched_data, treated_map, by = "subclass", all.x = TRUE)
 
-  cols_to_keep <- c("stack_id", "cohort_id", "id", "cohort_year",
+  # Restore User ID Name
+  setnames(matched_data, "id", id_col)
+
+  cols_to_keep <- c("stack_id", "cohort_id", id_col, "cohort_year",
                     "treat", "match_period", "weights", match_vars)
   cols_to_keep <- intersect(cols_to_keep, names(matched_data))
 
@@ -189,42 +207,66 @@ match_candidates <- function(dt,
 #' Expand Matched Cross-Section to Full Stacks
 #'
 #' @export
-expand_matched_stacks <- function(dt,
-                                  matched_data,
-                                  id_col,
-                                  time_col,
-                                  k_pre,
-                                  k_post,
-                                  match_by = -1) {
+expand_matched_stacks <- function(dt, matched_data, id_col, time_col, k_pre, k_post, match_by = -1) {
 
   if (!inherits(dt, "data.table")) setDT(dt)
   if (!inherits(matched_data, "data.table")) setDT(matched_data)
 
-  matched_data[, event_year := match_period - match_by]
+  # 1. Build Time Index Map from ORIGINAL data
+  # This tells us: For ID "A", Index 5 = "2015-01-01", Index 6 = "2015-04-01"
+  # This abstracts away the "Days vs Quarters" problem.
+  time_map <- dt[, .SD, .SDcols = c(id_col, time_col)]
+  setnames(time_map, c(id_col, time_col), c("id", "period"))
+  setorderv(time_map, c("id", "period"))
+  time_map[, time_idx := seq_len(.N), by = id]
+
+  # 2. Get Cohort Index
+  # We need to know: What Index corresponds to the 'cohort_year' (Event Time)?
+  matched_base <- copy(matched_data)
+  setnames(matched_base, id_col, "id")
+
+  # Join map to get the Index of the Cohort Date
+  matched_base <- merge(matched_base, time_map[, .(id, period, cohort_idx = time_idx)],
+                        by.x = c("id", "cohort_year"),
+                        by.y = c("id", "period"),
+                        all.x = TRUE, sort = FALSE)
+
+  # 3. Expand Rel Times
   rel_times <- seq(-k_pre, k_post)
 
-  meta_cols <- c("stack_id", "cohort_id", "id", "treat", "weights", "event_year", "cohort_year")
-  meta_cols <- intersect(meta_cols, names(matched_data))
+  meta_cols <- c("stack_id", "cohort_id", "id", "cohort_idx", "treat", "weights", "cohort_year")
+  meta_cols <- intersect(meta_cols, names(matched_base))
 
-  stack_defs <- matched_data[, ..meta_cols]
+  stack_defs <- matched_base[, ..meta_cols]
 
-  # Expansion
   n_stacks <- nrow(stack_defs)
   expanded_stacks <- stack_defs[rep(1:n_stacks, each = length(rel_times))]
   expanded_stacks[, rel_time := rep(rel_times, times = n_stacks)]
-  expanded_stacks[, period := event_year + rel_time]
 
-  # Merge back
+  # 4. Calculate Target Index
+  # Example: Cohort is Index 10. Rel_time -2. Target = Index 8.
+  expanded_stacks[, target_idx := cohort_idx + rel_time]
+
+  # 5. Retrieve Actual Date from Map using Target Index
+  # This effectively does: "What is the date 2 rows before the event?"
+  # It works perfectly for Quarters, Days, Years, etc.
+  expanded_stacks <- merge(expanded_stacks, time_map[, .(id, target_idx = time_idx, period)],
+                           by = c("id", "target_idx"),
+                           all.x = TRUE, sort = FALSE)
+
+  # 6. Merge Variables from DT using the retrieved Date
   final_df <- merge(expanded_stacks, dt,
                     by.x = c("id", "period"),
                     by.y = c(id_col, time_col),
                     all.x = TRUE, sort = FALSE)
 
   final_df[, post := as.integer(rel_time >= 0)]
+
+  # Cleanup & Rename
+  final_df[, c("cohort_idx", "target_idx") := NULL]
   setnames(final_df, "period", time_col)
   setnames(final_df, "id", id_col)
 
-  # Reorder
   first_cols <- c("stack_id", "cohort_id", id_col, time_col, "rel_time", "treat", "post", "weights")
   rest_cols <- setdiff(names(final_df), first_cols)
   setcolorder(final_df, c(first_cols, rest_cols))
@@ -232,18 +274,14 @@ expand_matched_stacks <- function(dt,
   return(final_df)
 }
 
+
 # ==============================================================================
 # 4. AUDIT: Quality Assessment
 # ==============================================================================
 #' Assess Matching Quality (Academic Standard)
 #'
 #' @export
-assess_match_quality <- function(match_res,
-                                 stack_candidates,
-                                 dt,
-                                 match_vars,
-                                 id_col,
-                                 time_col) {
+assess_match_quality <- function(match_res, stack_candidates, dt, match_vars, id_col, time_col) {
 
   if (!inherits(dt, "data.table")) setDT(dt)
 
@@ -256,9 +294,15 @@ assess_match_quality <- function(match_res,
   # Unmatched Pool
   cols_fetch <- c(id_col, time_col, covariates)
   dt_subset <- dt[, ..cols_fetch]
-  unmatched_pool <- merge(stack_candidates, dt_subset,
-                          by.x = c("id", "match_period"),
-                          by.y = c(id_col, time_col),
+
+  sc_copy <- copy(stack_candidates)
+  setnames(sc_copy, id_col, "id")
+
+  dt_sub_copy <- copy(dt_subset)
+  setnames(dt_sub_copy, c(id_col, time_col), c("id", "match_period"))
+
+  unmatched_pool <- merge(sc_copy, dt_sub_copy,
+                          by = c("id", "match_period"),
                           all.x = TRUE)
   unmatched_pool <- na.omit(unmatched_pool, cols = covariates)
 
@@ -324,24 +368,16 @@ assess_match_quality <- function(match_res,
 #' Plot Event Dynamics (Lasagna Plot with Overlay)
 #'
 #' @export
-plot_event_dynamics <- function(dt,
-                                dt_matched = NULL,
-                                id_col,
-                                time_col,
-                                event_col,
-                                n_bins = 4L,
-                                sort_by_intensity = FALSE) {
+plot_event_dynamics <- function(dt, dt_matched = NULL, id_col, time_col, event_col, n_bins = 4L, sort_by_intensity = FALSE) {
 
   if (!inherits(dt, "data.table")) setDT(dt)
 
-  # Safe Copy & Index Clear
   d <- copy(dt[, .SD, .SDcols = c(id_col, time_col, event_col)])
   setnames(d, c(id_col, time_col, event_col), c("id", "time", "event"))
   setkey(d, NULL)
 
   t_levels <- sort(unique(d$time))
 
-  # Stats
   id_stats <- d[, {
     tr_times <- time[event == 1L]
     tr_idx <- match(tr_times, t_levels)
@@ -350,7 +386,6 @@ plot_event_dynamics <- function(dt,
 
   id_stats[, is_treated := n_event > 0]
 
-  # Bins
   if (isTRUE(sort_by_intensity)) {
     treated_mask <- id_stats$is_treated == TRUE
     if (sum(treated_mask) > 0) {
@@ -366,7 +401,6 @@ plot_event_dynamics <- function(dt,
     id_stats[, bin := ifelse(is_treated, 1L, 0L)]
   }
 
-  # Waterfall Sort
   K <- max(id_stats$n_event, na.rm = TRUE)
   if (!is.finite(K) || K < 1L) K <- 1L
 
@@ -382,14 +416,12 @@ plot_event_dynamics <- function(dt,
   setnames(keys, time_key_cols)
   id_stats <- cbind(id_stats, keys)
 
-  # Sort: Bin(Asc), Time(Desc=Late->Early), ID
   sort_order <- c("bin", time_key_cols, "id")
   order_directions <- c(1, rep(-1, length(time_key_cols)), 1)
   setorderv(id_stats, cols = sort_order, order = order_directions)
 
   id_levels_sorted <- id_stats$id
 
-  # Plot Base
   p <- ggplot() +
     scale_x_discrete(drop = FALSE) + scale_y_discrete(drop = FALSE) +
     labs(title = "Event Dynamics & Matched Stacks",
@@ -406,13 +438,11 @@ plot_event_dynamics <- function(dt,
     p <- p + geom_raster(data = plot_data_base, aes(x = time_factor, y = id_factor), fill = "green4")
   }
 
-  # Overlay
   if (!is.null(dt_matched)) {
     if (!inherits(dt_matched, "data.table")) setDT(dt_matched)
     use_id <- if (id_col %in% names(dt_matched)) id_col else "id"
     use_time <- if (time_col %in% names(dt_matched)) time_col else "period"
 
-    # Red (Treated - Solid)
     mat_trt <- dt_matched[treat == 1, .N, by = c(use_id, use_time)]
     setnames(mat_trt, c("id", "time", "N"))
     mat_trt <- mat_trt[id %in% id_levels_sorted & time %in% t_levels]
@@ -422,7 +452,6 @@ plot_event_dynamics <- function(dt,
       p <- p + geom_raster(data = mat_trt, aes(x = time_factor, y = id_factor), fill = "firebrick", alpha = 1)
     }
 
-    # Blue (Control - Weighted)
     mat_ctrl <- dt_matched[treat == 0, .N, by = c(use_id, use_time)]
     setnames(mat_ctrl, c("id", "time", "N"))
     mat_ctrl <- mat_ctrl[id %in% id_levels_sorted & time %in% t_levels]
@@ -487,7 +516,6 @@ flexmatch <- function(dt,
   if (verbose) message("\n=== Starting Flexmatch Pipeline ===")
   if (!inherits(dt, "data.table")) setDT(dt)
 
-  # 1. SCAN
   if (verbose) message(sprintf("1. Scanning Candidates (Type: Treated='%s', Control='%s')...", treated_type, control_type))
 
   cands <- label_candidates(
@@ -500,18 +528,16 @@ flexmatch <- function(dt,
   if (n_treat == 0) stop("No valid treated candidates found.")
   if (verbose) message(sprintf("   Candidates found: %d Treated, %d Control.", n_treat, nrow(cands[treat == 0])))
 
-  # 2. MATCH
   if (verbose) message(sprintf("2. Matching on [%s]...", paste(match_vars, collapse = ", ")))
   match_res <- match_candidates(dt, cands, id_col, time_col, match_vars, ...)
 
-  n_matched <- uniqueN(match_res$matched_cross_section[treat==1, id])
+  # FIX: Count matches using get(id_col)
+  n_matched <- uniqueN(match_res$matched_cross_section[treat==1, get(id_col)])
   if (verbose) message(sprintf("   Matched %d / %d Treated units (%.1f%%).", n_matched, n_treat, 100 * n_matched / n_treat))
 
-  # 3. BUILD
   if (verbose) message("3. Expanding Stacks...")
   final_data <- expand_matched_stacks(dt, match_res$matched_cross_section, id_col, time_col, k_pre, k_post, match_by)
 
-  # 4. ASSESS
   quality_stats <- NULL
   if (assess_quality) {
     if (verbose) message("4. Assessing Quality...")
@@ -520,7 +546,6 @@ flexmatch <- function(dt,
     }, error = function(e) warning(paste("Quality Check Failed:", e$message)))
   }
 
-  # 5. VISUALIZE
   event_plot <- NULL
   if (plot_events) {
     if (verbose) message("5. Generating Event Dynamics Plot...")
